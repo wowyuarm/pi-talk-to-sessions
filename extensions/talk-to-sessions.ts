@@ -3,17 +3,17 @@
  *
  * Talk to another pi session's agent from within the current session.
  *
- * Mental model: the current agent treats another session as a "context
- * retrieval point." The other session's full conversation history (its
- * effective context, post-compaction) is loaded read-only into an isolated
- * in-memory sub-session, and its last-used model answers a question. The
- * target session file is never modified. The question is prepended with a
- * short note telling the other agent that the questioner is a different
- * session without its context.
+ * Mental model: the current agent treats another session as a context
+ * retrieval point. The target's effective conversation history is loaded
+ * read-only into an isolated in-memory sub-session. A small external sidecar
+ * stores only prior exchanges from this caller to this target, so the target
+ * can continue that relationship without modifying either session file.
  */
 
+import { randomUUID } from "node:crypto";
 import { statSync } from "node:fs";
-import { basename } from "node:path";
+import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
+import { basename, join } from "node:path";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import {
 	AuthStorage,
@@ -26,14 +26,22 @@ import {
 import { Type } from "typebox";
 
 /**
- * Prepended to the caller's question so the target session's agent knows who
- * is asking and that the asker does not share its context.
+ * Prepended to the caller's question so the target agent can distinguish the
+ * new request from its own original session context and restored exchanges.
  */
 const PREFACE =
-	"[The question below comes from another pi session's agent. It does not have access to this session's context. Answer it based on the conversation history available in this session.]";
+	"[The question below comes from another pi session's agent. Answer it directly using your session context and any restored prior exchanges with that calling agent.]";
 
 /** Max sessions returned by list_sessions. */
 const MAX_LIST = 100;
+
+/** Prior exchanges live beside, never inside, Pi session files. */
+const BRIDGE_DIR = "talk-to-sessions";
+const BRIDGE_VERSION = 1;
+const MAX_BRIDGE_EXCHANGES = 12;
+const MAX_BRIDGE_CONTEXT_CHARS = 24_000;
+const MAX_BRIDGE_QUESTION_CHARS = 6_000;
+const MAX_BRIDGE_ANSWER_CHARS = 12_000;
 
 /** Lazily-created auth + model registry, shared across calls. Reads the host's
  * ~/.pi/agent/auth.json and models.json, so the sub-session uses the same
@@ -57,11 +65,113 @@ function formatDate(d: Date): string {
 	return d.toISOString().replace("T", " ").slice(0, 16) + " UTC";
 }
 
+function clipForBridgeContext(text: string, max: number): string {
+	return text.length <= max ? text : `${text.slice(0, max)}\n[truncated for bridge context]`;
+}
+
 interface ResolvedSession {
 	path: string;
 	cwd: string;
 	firstMessage: string;
 	name?: string;
+}
+
+interface BridgeExchange {
+	version: number;
+	occurredAt: string;
+	callerSessionId: string;
+	targetSessionId: string;
+	question: string;
+	answer: string;
+	model: string;
+}
+
+function bridgePairDir(firstSessionId: string, secondSessionId: string): string {
+	const [a, b] = [firstSessionId, secondSessionId].sort();
+	return join(getAgentDir(), BRIDGE_DIR, `${a}--${b}`);
+}
+
+function isBridgeExchange(value: unknown): value is BridgeExchange {
+	if (!value || typeof value !== "object") return false;
+	const exchange = value as Record<string, unknown>;
+	return (
+		exchange.version === BRIDGE_VERSION &&
+		typeof exchange.occurredAt === "string" &&
+		typeof exchange.callerSessionId === "string" &&
+		typeof exchange.targetSessionId === "string" &&
+		typeof exchange.question === "string" &&
+		typeof exchange.answer === "string" &&
+		typeof exchange.model === "string"
+	);
+}
+
+async function loadBridgeExchanges(
+	callerSessionId: string,
+	targetSessionId: string,
+): Promise<BridgeExchange[]> {
+	let names: string[];
+	try {
+		names = await readdir(bridgePairDir(callerSessionId, targetSessionId));
+	} catch (error) {
+		if ((error as { code?: unknown }).code === "ENOENT") return [];
+		throw error;
+	}
+
+	const recentNames = names
+		.filter((name) => name.endsWith(".json"))
+		.sort()
+		.slice(-MAX_BRIDGE_EXCHANGES * 2);
+	const exchanges: BridgeExchange[] = [];
+	for (const name of recentNames) {
+		try {
+			const parsed: unknown = JSON.parse(
+				await readFile(join(bridgePairDir(callerSessionId, targetSessionId), name), "utf8"),
+			);
+			if (isBridgeExchange(parsed)) exchanges.push(parsed);
+		} catch {
+			// A damaged or incomplete sidecar entry must not stop the conversation.
+		}
+	}
+	return exchanges
+		.sort((a, b) => a.occurredAt.localeCompare(b.occurredAt))
+		.slice(-MAX_BRIDGE_EXCHANGES);
+}
+
+function bridgeContext(
+	exchanges: BridgeExchange[],
+	targetSessionId: string,
+): { content?: string; count: number } {
+	if (exchanges.length === 0) return { count: 0 };
+
+	const lines = [
+		"[Restored cross-session exchange history]",
+		"The following is a private record of prior conversations between you and the current calling agent. It is not part of your original session, but treat it as already-established context with this agent.",
+	];
+	let used = lines.join("\n").length;
+	let count = 0;
+	for (const exchange of [...exchanges].reverse()) {
+		const youAnswered = exchange.targetSessionId === targetSessionId;
+		const question = clipForBridgeContext(exchange.question, MAX_BRIDGE_QUESTION_CHARS);
+		const answer = clipForBridgeContext(exchange.answer, MAX_BRIDGE_ANSWER_CHARS);
+		const block = youAnswered
+			? `\nOther agent asked you:\n${question}\n\nYou answered:\n${answer}\n`
+			: `\nYou asked the other agent:\n${question}\n\nOther agent answered:\n${answer}\n`;
+		if (used + block.length > MAX_BRIDGE_CONTEXT_CHARS) break;
+		lines.splice(2, 0, block);
+		used += block.length;
+		count++;
+	}
+	return { content: count ? lines.join("\n") : undefined, count };
+}
+
+async function saveBridgeExchange(exchange: BridgeExchange): Promise<void> {
+	const dir = bridgePairDir(exchange.callerSessionId, exchange.targetSessionId);
+	await mkdir(dir, { recursive: true, mode: 0o700 });
+	const name = `${exchange.occurredAt.replace(/[:.]/g, "-")}_${randomUUID()}.json`;
+	const destination = join(dir, name);
+	const temporary = `${destination}.tmp`;
+	await writeFile(temporary, `${JSON.stringify(exchange)}\n`, { mode: 0o600, flag: "wx" });
+	await rename(temporary, destination);
 }
 
 /** Resolve a session reference (file path or a phrase from its first user
@@ -194,13 +304,13 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			limit: Type.Optional(
 				Type.Number({
-					description: "Max sessions to return (most recent first). Default 30.",
-					default: 30,
+					description: "Max sessions to return (most recent first). Default 10.",
+					default: 10,
 				}),
 			),
 		}),
 		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-			const limit = Math.max(1, Math.min(params.limit ?? 30, MAX_LIST));
+			const limit = Math.max(1, Math.min(params.limit ?? 10, MAX_LIST));
 			const current = ctx.sessionManager.getSessionFile();
 			const all = await SessionManager.listAll();
 			const sessions = all
@@ -250,16 +360,14 @@ export default function (pi: ExtensionAPI) {
 		name: "talk_to_session",
 		label: "Talk To Session",
 		description: [
-			"Ask a question to another pi session's agent. That session's full conversation",
-			"history (its effective context, post-compaction) is loaded read-only into an",
-			"isolated in-memory sub-session — the target session file is never modified —",
-			"and its last-used model answers. The question is prepended with a short note",
-			"telling the other agent that the questioner is a different session without its",
-			"context. Call list_sessions first to resolve the target session.",
+			"Ask a question to another pi session's agent. Its effective history is loaded",
+			"read-only into an isolated in-memory sub-session, while prior exchanges between",
+			"these two sessions are restored as temporary agent-to-agent context. Neither Pi",
+			"session file is modified. Call list_sessions first to resolve the target session.",
 		].join(" "),
-		promptSnippet: "Ask another session's agent a question using that session's context",
+		promptSnippet: "Continue an agent-to-agent conversation using another session's context",
 		promptGuidelines: [
-			"Use talk_to_session when the user wants to ask about, or continue from, another session's context. Call list_sessions first to resolve the target session.",
+			"Use talk_to_session when the user wants to ask, continue, or check a conversation with another session. Call list_sessions first to resolve the target session.",
 		],
 		parameters: Type.Object({
 			session: Type.String({
@@ -273,6 +381,7 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_toolCallId, params, signal, onUpdate, ctx) {
 			const { session: sessionRef, question } = params;
+			const callerSessionId = ctx.sessionManager.getSessionId();
 
 			// 1. Resolve target session.
 			const resolved = await resolveSession(sessionRef, ctx.sessionManager.getSessionFile());
@@ -315,7 +424,20 @@ export default function (pi: ExtensionAPI) {
 			}
 
 			const bCwd = reader.getCwd() || ctx.cwd;
+			const targetSessionId = reader.getSessionId();
 			const targetModelInfo = bctx.model; // { provider, modelId } | null
+
+			// A already has prior exchanges in its own session. Restore only the
+			// missing half: this target's previous conversation with this caller.
+			let priorExchanges: BridgeExchange[] = [];
+			let bridgeReadNote = "";
+			if (callerSessionId && targetSessionId) {
+				try {
+					priorExchanges = await loadBridgeExchanges(callerSessionId, targetSessionId);
+				} catch (error) {
+					bridgeReadNote = `Could not restore prior cross-session exchanges: ${(error as Error).message}`;
+				}
+			}
 
 			// 3. Resolve model: target session's last model, else current session's model.
 			const { authStorage, modelRegistry } = registries();
@@ -378,8 +500,21 @@ export default function (pi: ExtensionAPI) {
 			});
 			const sub = created.session;
 
-			// 5. Inject the target session's history as the sub-session's context.
-			sub.agent.state.messages = bctx.messages;
+			// 5. Inject original target history plus this pair's prior exchanges.
+			// This is in-memory only: neither Pi session file is changed.
+			const restoredBridge = bridgeContext(priorExchanges, targetSessionId);
+			sub.agent.state.messages = restoredBridge.content
+				? [
+						...bctx.messages,
+						{
+							role: "custom",
+							customType: "talk-to-sessions:bridge-history",
+							content: restoredBridge.content,
+							display: false,
+							timestamp: Date.now(),
+						},
+					]
+				: bctx.messages;
 
 			// 6. Wire abort from the calling agent's signal.
 			const onAbort = () => {
@@ -420,6 +555,25 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
+			// A's tool call/result is already in A's session. Persist this complete
+			// exchange only so B can recover it during a later call from A.
+			let bridgeWriteNote = "";
+			if (answer && callerSessionId && targetSessionId) {
+				try {
+					await saveBridgeExchange({
+						version: BRIDGE_VERSION,
+						occurredAt: new Date().toISOString(),
+						callerSessionId,
+						targetSessionId,
+						question,
+						answer,
+						model: `${model.provider}/${model.id}`,
+					});
+				} catch (error) {
+					bridgeWriteNote = `Could not save this cross-session exchange: ${(error as Error).message}`;
+				}
+			}
+
 			// 7. Build the return: the answer verbatim, plus a compact provenance
 			//    footer so the calling agent knows the source and that it may be
 			//    stale relative to current files.
@@ -433,7 +587,10 @@ export default function (pi: ExtensionAPI) {
 				`via session ${basename(targetPath)}`,
 				lastModified ? `last modified ${lastModified}` : "",
 				`model ${model.provider}/${model.id}`,
+				restoredBridge.count ? `restored ${restoredBridge.count} prior exchange${restoredBridge.count === 1 ? "" : "s"}` : "",
 				fallbackNote,
+				bridgeReadNote,
+				bridgeWriteNote,
 			]
 				.filter(Boolean)
 				.join(" · ");
@@ -452,6 +609,9 @@ export default function (pi: ExtensionAPI) {
 						? `${targetModelInfo.provider}/${targetModelInfo.modelId}`
 						: null,
 					fallbackNote: fallbackNote || undefined,
+					restoredExchangeCount: restoredBridge.count,
+					bridgeReadNote: bridgeReadNote || undefined,
+					bridgeWriteNote: bridgeWriteNote || undefined,
 					usage,
 				},
 			};

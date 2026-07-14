@@ -22,19 +22,20 @@ and brings the answer back.
 current session (you ↔ agent A)        target session B (on disk)
 ┌──────────────────────────┐           ┌─────────────────────────┐
 │ current task context     │           │ B's full history        │
-│ your question            │           │ (post-compaction)       │
-│                          │  ask ──►  │ B's last-used model     │
+│ A already retains result │  ask ──►  │ B's last-used model     │
 │ answer brought back ◄─── │           │ answers from its memory │
 └──────────────────────────┘           └─────────────────────────┘
-                                            ▲
-                                            │ read-only, never modified
+                  │                         ▲
+                  └──── exchange sidecar ───┘
+                    only restores A ↔ B history to B
 ```
 
 Key properties:
 
-- **B is never modified.** Its `.jsonl` file is opened read-only. The
-  conversation happens in an in-memory sub-session that is discarded after
-  the answer is returned.
+- **Neither Pi session is modified by the bridge.** B's `.jsonl` file is
+  opened read-only. A already stores its own tool call and result normally.
+  A small external sidecar is the only added persistence: it retains completed
+  A ↔ B exchanges solely so B can recover its missing half on a later call.
 - **B's model is inherited.** The sub-session uses the model B was last
   using, so you're talking to "the same agent that has B's memory." If that
   model is no longer available, it falls back to the current session's model
@@ -49,8 +50,11 @@ Key properties:
   skills, prompt templates, or themes. (It does inherit B's working
   directory's `AGENTS.md` context files, since those are part of B's working
   context.)
-- **A short preface is prepended to the question** so B's agent knows the
-  questioner is a different session that does not share its context.
+- **Prior exchanges are restored only for B.** A already has them in its own
+  session. B receives a temporary, clearly marked `you / other agent` history
+  before the new question; it is not written into B's session file.
+- **A short preface is prepended to the question** so B's agent can distinguish
+  the new request from its original context and restored exchange history.
 
 ## Install
 
@@ -78,7 +82,7 @@ message, message count, and last modified time. Use this to find the session
 you want to talk to.
 
 Parameters:
-- `limit` (optional, default 30, max 100) — number of sessions to return.
+- `limit` (optional, default 10, max 100) — number of sessions to return.
 
 ### `talk_to_session`
 
@@ -106,14 +110,14 @@ path, working directory, and first message.
 
 ## Design notes
 
-- **Stateless.** Each `talk_to_session` call is independent — a fresh
-  in-memory sub-session is created and disposed per call. The target
-  session's memory persists (it's on disk); the sub-session's short-term
-  memory of *this* question does not. If you need a multi-turn back-and-forth
-  with B, ask a more complete question in one call.
-- **Cost.** Each call is a full LLM completion carrying B's effective context.
-  The larger B's context, the more tokens. This is inherent to "talk to that
-  session's agent."
+- **Continuing exchange, without polluting sessions.** Each call still uses a
+  fresh in-memory sub-session, but successful exchanges are saved under
+  `~/.pi/agent/talk-to-sessions/<session-id>--<session-id>/`. On a later call
+  between the same two sessions, up to the latest 12 exchanges (and 24,000
+  characters) are restored to B as `you / other agent` context. Each exchange
+  is a separate immutable file, so concurrent calls cannot overwrite history.
+- **Cost.** Each call is a full LLM completion carrying B's effective context
+  plus the restored exchange history. The larger either is, the more tokens.
 - **Staleness.** B's answers reflect its state as of its last turn. They are
   reliable for "what did we decide" but may be out of date for "what does the
   code look like now." The provenance footer makes this visible.
