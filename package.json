@@ -1,6 +1,6 @@
 {
   "name": "pi-talk-to-sessions",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "A pi extension to talk to another pi session's agent from within the current session, using that session's context.",
   "type": "module",
   "license": "MIT",
@@ -33,7 +33,7 @@
     "typebox": "*"
   },
   "devDependencies": {
-    "@earendil-works/pi-coding-agent": "0.80.2",
+    "@earendil-works/pi-coding-agent": "1.0.4",
     "typebox": "1.1.38",
     "typescript": "^5.9.0"
   }

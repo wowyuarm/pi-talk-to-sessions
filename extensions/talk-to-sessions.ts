@@ -8,20 +8,28 @@
  * read-only into an isolated in-memory sub-session. A small external sidecar
  * stores only prior exchanges from this caller to this target, so the target
  * can continue that relationship without modifying either session file.
+ *
+ * pi 1.0 notes:
+ * - The host's `ctx.modelRegistry` is used directly for model lookup, so no
+ *   separate auth/registry cache is kept (and it can never go stale).
+ * - `createAgentSession()` no longer takes `authStorage`/`modelRegistry`; it
+ *   builds a default `ModelRuntime` from the same `agentDir` files.
+ * - `SessionManager` owns finalized model context: target history is restored
+ *   by preloading an in-memory manager with the target's entries (plus one
+ *   `custom_message` entry for bridge history). Assigning
+ *   `agent.state.messages` directly no longer affects persisted context.
  */
 
 import { randomUUID } from "node:crypto";
-import { statSync } from "node:fs";
-import { mkdir, readdir, readFile, rename, writeFile } from "node:fs/promises";
+import { existsSync, statSync } from "node:fs";
+import { mkdir, readdir, readFile, rename, unlink, writeFile } from "node:fs/promises";
 import { basename, join } from "node:path";
-import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, SessionEntry, SessionInfo } from "@earendil-works/pi-coding-agent";
 import {
-	AuthStorage,
-	createAgentSession,
 	DefaultResourceLoader,
 	getAgentDir,
-	ModelRegistry,
 	SessionManager,
+	createAgentSession,
 } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
@@ -35,26 +43,26 @@ const PREFACE =
 /** Max sessions returned by list_sessions. */
 const MAX_LIST = 100;
 
+/** Cap for the interactive /sessions picker. */
+const MAX_PICKER = 50;
+
+/** Custom message type marking restored bridge history inside the sub-session. */
+const BRIDGE_CUSTOM_TYPE = "talk-to-sessions:bridge-history";
+
 /** Prior exchanges live beside, never inside, Pi session files. */
 const BRIDGE_DIR = "talk-to-sessions";
 const BRIDGE_VERSION = 1;
 const MAX_BRIDGE_EXCHANGES = 12;
+const MAX_BRIDGE_FILES = MAX_BRIDGE_EXCHANGES * 2;
 const MAX_BRIDGE_CONTEXT_CHARS = 24_000;
 const MAX_BRIDGE_QUESTION_CHARS = 6_000;
 const MAX_BRIDGE_ANSWER_CHARS = 12_000;
 
-/** Lazily-created auth + model registry, shared across calls. Reads the host's
- * ~/.pi/agent/auth.json and models.json, so the sub-session uses the same
- * credentials as the interactive session. */
-let cachedAuth: AuthStorage | undefined;
-let cachedRegistry: ModelRegistry | undefined;
-function registries(): { authStorage: AuthStorage; modelRegistry: ModelRegistry } {
-	if (!cachedAuth || !cachedRegistry) {
-		cachedAuth = AuthStorage.create();
-		cachedRegistry = ModelRegistry.create(cachedAuth);
-	}
-	return { authStorage: cachedAuth, modelRegistry: cachedRegistry };
-}
+/** Max options shown when a session reference is ambiguous. */
+const MAX_MATCH_OPTIONS = 8;
+
+/** Minimum characters before trying session-ID prefix matching. */
+const MIN_ID_PREFIX = 4;
 
 function preview(text: string, max: number): string {
 	const clean = (text || "").replace(/\s+/g, " ").trim();
@@ -109,9 +117,10 @@ async function loadBridgeExchanges(
 	callerSessionId: string,
 	targetSessionId: string,
 ): Promise<BridgeExchange[]> {
+	const dir = bridgePairDir(callerSessionId, targetSessionId);
 	let names: string[];
 	try {
-		names = await readdir(bridgePairDir(callerSessionId, targetSessionId));
+		names = await readdir(dir);
 	} catch (error) {
 		if ((error as { code?: unknown }).code === "ENOENT") return [];
 		throw error;
@@ -120,13 +129,11 @@ async function loadBridgeExchanges(
 	const recentNames = names
 		.filter((name) => name.endsWith(".json"))
 		.sort()
-		.slice(-MAX_BRIDGE_EXCHANGES * 2);
+		.slice(-MAX_BRIDGE_FILES);
 	const exchanges: BridgeExchange[] = [];
 	for (const name of recentNames) {
 		try {
-			const parsed: unknown = JSON.parse(
-				await readFile(join(bridgePairDir(callerSessionId, targetSessionId), name), "utf8"),
-			);
+			const parsed: unknown = JSON.parse(await readFile(join(dir, name), "utf8"));
 			if (isBridgeExchange(parsed)) exchanges.push(parsed);
 		} catch {
 			// A damaged or incomplete sidecar entry must not stop the conversation.
@@ -172,84 +179,109 @@ async function saveBridgeExchange(exchange: BridgeExchange): Promise<void> {
 	const temporary = `${destination}.tmp`;
 	await writeFile(temporary, `${JSON.stringify(exchange)}\n`, { mode: 0o600, flag: "wx" });
 	await rename(temporary, destination);
+
+	// Best-effort pruning so stale sidecar files cannot accumulate forever.
+	try {
+		const names = (await readdir(dir))
+			.filter((entry) => entry.endsWith(".json"))
+			.sort();
+		const excess = names.slice(0, Math.max(0, names.length - MAX_BRIDGE_FILES));
+		await Promise.all(excess.map((entry) => unlink(join(dir, entry)).catch(() => {})));
+	} catch {
+		// Pruning must never fail the conversation.
+	}
 }
 
-/** Resolve a session reference (file path or a phrase from its first user
- * message) to a SessionInfo-like object. Returns an error string on failure. */
+function toResolved(s: SessionInfo): ResolvedSession {
+	return {
+		path: s.path,
+		cwd: s.cwd || "",
+		firstMessage: s.firstMessage || "(empty)",
+		name: s.name,
+	};
+}
+
+function matchOptions(ref: string, matches: SessionInfo[]): string {
+	const shown = matches
+		.slice(0, MAX_MATCH_OPTIONS)
+		.map((s, i) => `${i + 1}. ${preview(s.name || s.firstMessage, 120)}\n   path: ${s.path}`)
+		.join("\n\n");
+	const more =
+		matches.length > MAX_MATCH_OPTIONS ? `\n\n… and ${matches.length - MAX_MATCH_OPTIONS} more.` : "";
+	return (
+		`Multiple sessions match "${ref}". Pass a more specific phrase, a session ID, or a path:\n\n` +
+		`${shown}${more}`
+	);
+}
+
+/** Resolve a session reference (file path, basename, session ID, or a phrase
+ * from its first user message / display name) to a session. Phrase and ID
+ * matching search every project; use list_sessions to browse first. Returns
+ * an error string on failure. */
 async function resolveSession(
 	sessionRef: string,
 	currentFile: string | undefined,
 ): Promise<ResolvedSession | { error: string }> {
+	const ref = sessionRef.trim();
+
 	// 1. Direct file path.
-	if (existsSyncSafe(sessionRef)) {
+	if (existsSync(ref)) {
 		try {
-			const reader = SessionManager.open(sessionRef);
-			const header = reader.getHeader();
-			const entries = reader.getEntries();
-			const firstMessage = firstUserMessage(entries) ?? "(empty)";
+			const reader = SessionManager.open(ref);
 			return {
-				path: sessionRef,
-				cwd: header?.cwd || "",
-				firstMessage,
+				path: ref,
+				cwd: reader.getCwd() || "",
+				firstMessage: firstUserMessage(reader.getEntries()) ?? "(empty)",
 				name: reader.getSessionName() ?? undefined,
 			};
 		} catch {
-			return { error: `Could not open session file: ${sessionRef}` };
+			return { error: `Could not open session file: ${ref}` };
 		}
 	}
 
-	// 2. Match by first user message (case-insensitive substring).
-	const all = await SessionManager.listAll();
-	const needle = sessionRef.toLowerCase();
+	const all = (await SessionManager.listAll()).filter((s) => s.path !== currentFile);
+	const lower = ref.toLowerCase();
+
+	// 2. Exact session path, file basename, or session ID.
+	const exact = all.filter(
+		(s) => s.path === ref || basename(s.path) === ref || s.id === ref || s.id.toLowerCase() === lower,
+	);
+	if (exact.length === 1) return toResolved(exact[0]);
+	if (exact.length > 1) return { error: matchOptions(ref, exact) };
+
+	// 3. Unique session-ID prefix (avoids flooding on very short input).
+	if (ref.length >= MIN_ID_PREFIX) {
+		const prefixed = all.filter((s) => s.id.toLowerCase().startsWith(lower));
+		if (prefixed.length === 1) return toResolved(prefixed[0]);
+		if (prefixed.length > 1) return { error: matchOptions(ref, prefixed) };
+	}
+
+	// 4. Phrase from the display name or first user message (case-insensitive).
 	const matches = all
-		.filter((s) => s.path !== currentFile)
-		.filter((s) => (s.firstMessage || "").toLowerCase().includes(needle))
+		.filter((s) => `${s.name || ""} ${s.firstMessage || ""}`.toLowerCase().includes(lower))
 		.sort((a, b) => b.modified.getTime() - a.modified.getTime());
 
 	if (matches.length === 0) {
 		return {
-			error: `No session found matching "${sessionRef}". Call list_sessions to see available sessions.`,
+			error: `No session found matching "${ref}". Call list_sessions to see available sessions.`,
 		};
 	}
-	if (matches.length > 1) {
-		const opts = matches
-			.map((s, i) => `${i + 1}. ${preview(s.name || s.firstMessage, 120)}\n   path: ${s.path}`)
-			.join("\n\n");
-		return {
-			error: `Multiple sessions match "${sessionRef}". Pass a more specific phrase or a path:\n\n${opts}`,
-		};
-	}
-	const m = matches[0];
-	return {
-		path: m.path,
-		cwd: m.cwd || "",
-		firstMessage: m.firstMessage || "(empty)",
-		name: m.name,
-	};
-}
-
-function existsSyncSafe(p: string): boolean {
-	try {
-		// Avoid importing fs just for this; statSync throws if missing.
-		statSync(p);
-		return true;
-	} catch {
-		return false;
-	}
+	if (matches.length > 1) return { error: matchOptions(ref, matches) };
+	return toResolved(matches[0]);
 }
 
 /** Find the first user text message in a list of session entries. */
-function firstUserMessage(entries: ReturnType<SessionManager["getEntries"]>): string | undefined {
+function firstUserMessage(entries: SessionEntry[]): string | undefined {
 	for (const entry of entries) {
 		if (entry.type === "message") {
-			const msg = (entry as { message?: { role?: string; content?: unknown } }).message;
+			const msg = entry.message;
 			if (msg?.role === "user") {
 				const content = msg.content;
 				if (typeof content === "string") return content;
 				if (Array.isArray(content)) {
 					const text = content
-						.filter((c: { type?: string }) => c.type === "text")
-						.map((c: { text?: string }) => c.text ?? "")
+						.filter((c) => c.type === "text")
+						.map((c) => c.text ?? "")
 						.join(" ");
 					if (text) return text;
 				}
@@ -259,28 +291,17 @@ function firstUserMessage(entries: ReturnType<SessionManager["getEntries"]>): st
 	return undefined;
 }
 
-/** Extract the text of the last assistant message from a message list. */
-function lastAssistantText(messages: { role?: string; content?: unknown }[]): {
-	text: string;
-	usage?: unknown;
-} {
+/** Find usage on the last assistant message carrying one. */
+function lastAssistantUsage(messages: readonly { role?: string; usage?: unknown }[]): unknown {
 	for (let i = messages.length - 1; i >= 0; i--) {
 		const m = messages[i];
-		if (m.role === "assistant") {
-			const content = m.content;
-			let text = "";
-			if (typeof content === "string") {
-				text = content;
-			} else if (Array.isArray(content)) {
-				text = content
-					.filter((c: { type?: string }) => c.type === "text")
-					.map((c: { text?: string }) => c.text ?? "")
-					.join("\n");
-			}
-			return { text: text.trim(), usage: (m as { usage?: unknown }).usage };
-		}
+		if (m?.role === "assistant" && m.usage) return m.usage;
 	}
-	return { text: "" };
+	return undefined;
+}
+
+function byModifiedDesc(a: SessionInfo, b: SessionInfo): number {
+	return b.modified.getTime() - a.modified.getTime();
 }
 
 export default function (pi: ExtensionAPI) {
@@ -291,15 +312,17 @@ export default function (pi: ExtensionAPI) {
 		name: "list_sessions",
 		label: "List Sessions",
 		description: [
-			"List recent pi sessions across all projects (excluding the current session),",
-			"most recent first. Each entry shows a path, working directory, first user",
-			"message, message count, and last modified time. Use this to find a session",
-			"to talk to, then pass its path (or a distinctive phrase from its first",
-			"message) to talk_to_session.",
+			"List recent pi sessions for the current project (same working directory),",
+			"most recent first, excluding the current session. Each entry shows a path,",
+			"working directory, first user message, message count, and last modified",
+			"time. Use this to find a session to talk to, then pass its path (or a",
+			"distinctive phrase from its first message) to talk_to_session.",
+			"Pass a different cwd to browse another project, or all=true to list",
+			"sessions across every project.",
 		].join(" "),
 		promptSnippet: "List recent pi sessions to find one to talk to",
 		promptGuidelines: [
-			"Use list_sessions when the user refers to another session by its topic or first message and you need to find its path.",
+			"Use list_sessions when the user refers to another session by its topic or first message and you need to find its path. It lists the current project by default; pass all=true to search every project.",
 		],
 		parameters: Type.Object({
 			limit: Type.Optional(
@@ -308,20 +331,49 @@ export default function (pi: ExtensionAPI) {
 					default: 10,
 				}),
 			),
+			cwd: Type.Optional(
+				Type.String({
+					description:
+						"Working directory whose sessions to list. Defaults to the current session's directory.",
+				}),
+			),
+			all: Type.Optional(
+				Type.Boolean({
+					description: "List sessions across all projects instead of just the current one. Default false.",
+					default: false,
+				}),
+			),
 		}),
-		async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			const limit = Math.max(1, Math.min(params.limit ?? 10, MAX_LIST));
 			const current = ctx.sessionManager.getSessionFile();
-			const all = await SessionManager.listAll();
-			const sessions = all
-				.filter((s) => s.path !== current)
-				.sort((a, b) => b.modified.getTime() - a.modified.getTime())
-				.slice(0, limit);
+			const scopeCwd = params.cwd?.trim() || ctx.sessionManager.getCwd() || ctx.cwd;
+
+			let sessions: SessionInfo[];
+			let scopeLabel: string;
+			if (params.all) {
+				const allSessions = await SessionManager.listAll(undefined, undefined, signal);
+				sessions = allSessions
+					.filter((s) => s.path !== current)
+					.sort(byModifiedDesc)
+					.slice(0, limit);
+				scopeLabel = "all projects";
+			} else {
+				const scoped = await SessionManager.list(scopeCwd, undefined, undefined, signal);
+				sessions = scoped
+					.filter((s) => s.path !== current)
+					.sort(byModifiedDesc)
+					.slice(0, limit);
+				scopeLabel = scopeCwd;
+			}
 
 			if (sessions.length === 0) {
+				const hint = params.all
+					? "No other sessions found."
+					: `No other sessions found for ${scopeCwd}. Pass all=true to search every project.`;
 				return {
-					content: [{ type: "text", text: "No other sessions found." }],
-					details: { count: 0 },
+					content: [{ type: "text", text: hint }],
+					details: { count: 0, scope: scopeLabel },
 				};
 			}
 
@@ -338,11 +390,12 @@ export default function (pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text",
-						text: `Recent sessions (excluding current), ${sessions.length} shown:\n\n${lines.join("\n\n")}`,
+						text: `Recent sessions for ${scopeLabel} (excluding current), ${sessions.length} shown:\n\n${lines.join("\n\n")}`,
 					},
 				],
 				details: {
 					count: sessions.length,
+					scope: scopeLabel,
 					sessions: sessions.map((s) => ({
 						path: s.path,
 						cwd: s.cwd,
@@ -372,7 +425,7 @@ export default function (pi: ExtensionAPI) {
 		parameters: Type.Object({
 			session: Type.String({
 				description:
-					"Target session: either its file path, or a distinctive phrase from its first user message (matched case-insensitively).",
+					"Target session: its file path, file basename, session ID (exact or unique prefix), or a distinctive phrase from its first user message or display name (matched case-insensitively across all projects).",
 			}),
 			question: Type.String({
 				description:
@@ -439,17 +492,20 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			// 3. Resolve model: target session's last model, else current session's model.
-			const { authStorage, modelRegistry } = registries();
-			let model = ctx.model;
+			// 3. Resolve models: prefer the target session's last model, with the
+			//    current session's model as fallback. Auth is only proven at
+			//    request time (a provider can look configured yet fail key
+			//    resolution when called), so a failed first attempt retries once
+			//    with the fallback model instead of trusting a pre-check.
+			const registry = ctx.modelRegistry;
+			const targetModel = targetModelInfo
+				? registry.find(targetModelInfo.provider, targetModelInfo.modelId)
+				: undefined;
+			const fallbackModel = ctx.model;
+			let model = targetModel ?? fallbackModel;
 			let fallbackNote = "";
-			if (targetModelInfo) {
-				const m = modelRegistry.find(targetModelInfo.provider, targetModelInfo.modelId);
-				if (m && modelRegistry.hasConfiguredAuth(m)) {
-					model = m;
-				} else {
-					fallbackNote = `Target session's model (${targetModelInfo.provider}/${targetModelInfo.modelId}) is not available; fell back to current session's model.`;
-				}
+			if (!targetModel && targetModelInfo) {
+				fallbackNote = `Target session's model (${targetModelInfo.provider}/${targetModelInfo.modelId}) is not available; fell back to current session's model.`;
 			}
 			if (!model) {
 				return {
@@ -477,6 +533,11 @@ export default function (pi: ExtensionAPI) {
 			// 4. Isolated in-memory sub-session. No tools, no extensions/skills/
 			//    prompts/themes. Context files (AGENTS.md) from the target's cwd
 			//    are kept so the sub-session inherits the target's working context.
+			//    The target's entries are preloaded into the manager (the owner of
+			//    finalized model context), plus one hidden custom message carrying
+			//    this pair's prior exchanges. Nothing is written to either Pi
+			//    session file. A fresh manager is built per attempt so a failed
+			//    attempt leaves no trace in the retry.
 			const loader = new DefaultResourceLoader({
 				cwd: bCwd,
 				agentDir: getAgentDir(),
@@ -487,67 +548,89 @@ export default function (pi: ExtensionAPI) {
 			});
 			await loader.reload();
 
-			const created = await createAgentSession({
-				cwd: bCwd,
-				agentDir: getAgentDir(),
-				model,
-				thinkingLevel: bctx.thinkingLevel as never,
-				noTools: "all",
-				resourceLoader: loader,
-				sessionManager: SessionManager.inMemory(bCwd),
-				authStorage,
-				modelRegistry,
-			});
-			const sub = created.session;
-
-			// 5. Inject original target history plus this pair's prior exchanges.
-			// This is in-memory only: neither Pi session file is changed.
 			const restoredBridge = bridgeContext(priorExchanges, targetSessionId);
-			sub.agent.state.messages = restoredBridge.content
-				? [
-						...bctx.messages,
-						{
-							role: "custom",
-							customType: "talk-to-sessions:bridge-history",
-							content: restoredBridge.content,
-							display: false,
-							timestamp: Date.now(),
-						},
-					]
-				: bctx.messages;
+			const askWithModel = async (attemptModel: typeof model) => {
+				const subManager = SessionManager.inMemory(bCwd, undefined, reader.getEntries());
+				if (restoredBridge.content) {
+					subManager.appendCustomMessageEntry(BRIDGE_CUSTOM_TYPE, restoredBridge.content, false);
+				}
+				const created = await createAgentSession({
+					cwd: bCwd,
+					agentDir: getAgentDir(),
+					model: attemptModel,
+					thinkingLevel: bctx.thinkingLevel as never,
+					noTools: "all",
+					resourceLoader: loader,
+					sessionManager: subManager,
+				});
+				const sub = created.session;
 
-			// 6. Wire abort from the calling agent's signal.
-			const onAbort = () => {
-				void sub.abort().catch(() => {});
+				// 5. Wire abort from the calling agent's signal.
+				const onAbort = () => {
+					void sub.abort().catch(() => {});
+				};
+				if (signal) {
+					if (signal.aborted) onAbort();
+					else signal.addEventListener("abort", onAbort, { once: true });
+				}
+
+				try {
+					await sub.prompt(`${PREFACE}\n\n${question}`, { expandPromptTemplates: false });
+					return {
+						answer: sub.getLastAssistantText() ?? "",
+						usage: lastAssistantUsage(
+							sub.messages as { role?: string; usage?: unknown }[],
+						),
+					};
+				} finally {
+					if (signal) signal.removeEventListener("abort", onAbort);
+					sub.dispose();
+				}
 			};
-			if (signal) {
-				if (signal.aborted) onAbort();
-				else signal.addEventListener("abort", onAbort, { once: true });
-			}
 
 			let answer = "";
 			let usage: unknown;
 			let promptError: string | undefined;
 			try {
-				await sub.prompt(`${PREFACE}\n\n${question}`, { expandPromptTemplates: false });
-				const result = lastAssistantText(
-					sub.messages as { role?: string; content?: unknown }[],
-				);
-				answer = result.text;
-				usage = result.usage;
+				({ answer, usage } = await askWithModel(model));
 			} catch (err) {
-				promptError = (err as Error).message;
-			} finally {
-				if (signal) signal.removeEventListener("abort", onAbort);
-				sub.dispose();
+				const firstError = (err as Error).message;
+				const canRetry =
+					fallbackModel &&
+					model !== fallbackModel &&
+					/api key|auth|credential|login|unauthorized|forbidden/i.test(firstError);
+				if (!canRetry) {
+					promptError = firstError;
+				} else {
+					const firstLine = firstError.split("\n")[0];
+					fallbackNote = `Target session's model (${model.provider}/${model.id}) failed at request time (${firstLine}); fell back to current session's model.`;
+					model = fallbackModel;
+					onUpdate?.({
+						content: [
+							{
+								type: "text",
+								text: `Retrying session ${basename(targetPath)} (${model.provider}/${model.id})…`,
+							},
+						],
+						details: {},
+					});
+					try {
+						({ answer, usage } = await askWithModel(model));
+					} catch (retryErr) {
+						promptError = (retryErr as Error).message;
+					}
+				}
 			}
 
 			if (promptError) {
+					const hint = /api key|auth|credential|login|unauthorized|forbidden/i.test(promptError)
+					? "The model's credentials failed at request time — check that its provider is logged in, then try again."
+					: "This can happen if its context is too large for the model's window — try compacting that session first.";
 				return {
 					content: [
 						{
 							type: "text",
-							text: `The target session's agent failed to respond: ${promptError}\n\nThis can happen if its context is too large for the model's window — try compacting that session first.`,
+							text: `The target session's agent failed to respond: ${promptError}\n\n${hint}`,
 						},
 					],
 					details: { targetSession: targetPath, model: `${model.provider}/${model.id}` },
@@ -574,7 +657,7 @@ export default function (pi: ExtensionAPI) {
 				}
 			}
 
-			// 7. Build the return: the answer verbatim, plus a compact provenance
+			// 6. Build the return: the answer verbatim, plus a compact provenance
 			//    footer so the calling agent knows the source and that it may be
 			//    stale relative to current files.
 			let lastModified = "";
@@ -619,21 +702,36 @@ export default function (pi: ExtensionAPI) {
 	});
 
 	// --------------------------------------------------------------------
-	// Command: /sessions (human browsing)
+	// Command: /sessions (human browsing; current project by default)
 	// --------------------------------------------------------------------
 	pi.registerCommand("sessions", {
-		description: "Browse recent pi sessions",
-		handler: async (_args, ctx) => {
+		description: "Browse recent pi sessions (current project; 'all' for every project)",
+		handler: async (args, ctx) => {
 			if (!ctx.hasUI) return;
-			const all = await SessionManager.listAll();
+			const arg = args.trim();
 			const current = ctx.sessionManager.getSessionFile();
-			const sessions = all
-				.filter((s) => s.path !== current)
-				.sort((a, b) => b.modified.getTime() - a.modified.getTime())
-				.slice(0, 50);
+
+			let sessions: SessionInfo[];
+			let scopeLabel: string;
+			if (arg === "all") {
+				const allSessions = await SessionManager.listAll(undefined, undefined, ctx.signal ?? undefined);
+				sessions = allSessions
+					.filter((s) => s.path !== current)
+					.sort(byModifiedDesc)
+					.slice(0, MAX_PICKER);
+				scopeLabel = "all projects";
+			} else {
+				const dir = arg || ctx.sessionManager.getCwd() || ctx.cwd;
+				const scoped = await SessionManager.list(dir, undefined, undefined, ctx.signal ?? undefined);
+				sessions = scoped
+					.filter((s) => s.path !== current)
+					.sort(byModifiedDesc)
+					.slice(0, MAX_PICKER);
+				scopeLabel = dir;
+			}
 
 			if (sessions.length === 0) {
-				ctx.ui.notify("No other sessions found.", "info");
+				ctx.ui.notify(`No other sessions found (${scopeLabel}).`, "info");
 				return;
 			}
 
@@ -643,7 +741,7 @@ export default function (pi: ExtensionAPI) {
 				return `${i + 1}. ${when} · ${title} (${s.messageCount} msgs)`;
 			});
 
-			const choice = await ctx.ui.select("Pick a session:", labels);
+			const choice = await ctx.ui.select(`Pick a session (${scopeLabel}):`, labels);
 			if (choice == null) return;
 			const idx = labels.indexOf(choice);
 			if (idx < 0) return;

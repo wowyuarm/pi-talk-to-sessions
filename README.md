@@ -40,9 +40,10 @@ Key properties:
   using, so you're talking to "the same agent that has B's memory." If that
   model is no longer available, it falls back to the current session's model
   and says so.
-- **B's context is inherited, not its raw log.** The sub-session loads B's
-  *effective* context (what `buildSessionContext` produces — compaction
-  summaries plus recent turns), so a compacted B still answers coherently.
+- **B's context is inherited, not its raw log.** The sub-session preloads B's
+  entries into its own in-memory session manager (the owner of finalized model
+  context in pi 1.0), so what B would see — compaction summaries plus recent
+  turns — is what answers. A compacted B still answers coherently.
 - **No tools for B.** The sub-session has zero tools. It can only answer
   from memory — it cannot read files, run commands, or recurse into other
   sessions. It is a context retrieval point, not another worker.
@@ -58,7 +59,7 @@ Key properties:
 
 ## Install
 
-Requires pi 0.80.0 or newer. Tested with pi 0.80.2.
+Requires pi 1.0.0 or newer. Tested with pi 1.0.4.
 
 As a local path package (while developing):
 
@@ -76,13 +77,17 @@ pi -e ./extensions/talk-to-sessions.ts
 
 ### `list_sessions`
 
-Lists recent pi sessions across all projects (excluding the current one),
+Lists recent pi sessions for the current project (excluding the current one),
 most recent first. Each entry shows a path, working directory, first user
 message, message count, and last modified time. Use this to find the session
 you want to talk to.
 
 Parameters:
 - `limit` (optional, default 10, max 100) — number of sessions to return.
+- `cwd` (optional) — working directory whose sessions to list. Defaults to the
+  current session's directory.
+- `all` (optional, default false) — list sessions across all projects instead
+  of just the current one.
 
 ### `talk_to_session`
 
@@ -90,8 +95,9 @@ Asks a question to another session's agent. That session's history is loaded
 read-only and its last-used model answers.
 
 Parameters:
-- `session` — the target session: either its file path, or a distinctive
-  phrase from its first user message (matched case-insensitively).
+- `session` — the target session: its file path, file basename, session ID
+  (exact or unique prefix), or a distinctive phrase from its first user message
+  or display name (matched case-insensitively across all projects).
 - `question` — the question to ask, written by the calling agent. Sent
   verbatim, with a short preface prepended that tells the target agent who is
   asking.
@@ -106,7 +112,9 @@ to current files.
 ### `/sessions`
 
 Browse recent sessions interactively (for humans). Picks one and shows its
-path, working directory, and first message.
+path, working directory, and first message. Shows the current project by
+default; `/sessions all` browses every project, `/sessions <path>` browses
+another directory.
 
 ## Design notes
 
@@ -116,6 +124,13 @@ path, working directory, and first message.
   between the same two sessions, up to the latest 12 exchanges (and 24,000
   characters) are restored to B as `you / other agent` context. Each exchange
   is a separate immutable file, so concurrent calls cannot overwrite history.
+  Old sidecar files are pruned best-effort (keeps the latest 24) so the
+  directory cannot grow forever.
+- **Model fallback with one retry.** B's last-used model is tried first; if it
+  fails at request time (e.g. its provider is no longer logged in), the call
+  retries once with the current session's model and says so in the provenance
+  footer. Auth is only proven by calling — a provider can look configured yet
+  fail key resolution — so there is no pre-check, just try and retry.
 - **Cost.** Each call is a full LLM completion carrying B's effective context
   plus the restored exchange history. The larger either is, the more tokens.
 - **Staleness.** B's answers reflect its state as of its last turn. They are
